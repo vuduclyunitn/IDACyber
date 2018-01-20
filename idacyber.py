@@ -3,12 +3,11 @@ from PyQt5.QtWidgets import QWidget, QApplication, QCheckBox, QLabel, QComboBox,
 from PyQt5.QtGui import QPainter, QColor, QFont, QPen, QPixmap, QImage, qRgb
 from PyQt5.QtCore import Qt, QObject, pyqtSignal, QRect, QSize, QPoint
 from idaapi import *
+from ida_kernwin import msg
 from os import path
 import copy
 
 __author__ = 'Dennis Elser'
-
-USE_CACHE = False
 
 banner = """
 .___ .______  .______  ._______ ____   ____._______ ._______.______  
@@ -22,12 +21,11 @@ banner = """
 
 
 #   TODO:
+#   * refactor
 #   * sync mouse cursor to IDA cursor (ScreenEA())
 #   * optimized redrawing
 #   * load filters using "require" instead of using "import"
-#   * finish implementing cache
 #   * add grid?
-#   * use/hook invalidate_dbgmem_contents()?
 
 class ColorFilter():
     name = None
@@ -40,7 +38,7 @@ class ColorFilter():
     def on_mb_click(self, button, addr, mouse_offs):
         pass
     
-    def render_img(self, buf, addr, mouse_offs):
+    def render_img(self, buffers, addr, mouse_offs):
         return []
 
     def get_tooltip(self, addr, mouse_offs):
@@ -66,76 +64,37 @@ class SignalHandler(QObject):
 
 # -----------------------------------------------------------------------
 
-# based on https://www.blog.pythonlibrary.org/2016/02/25/python-an-intro-to-caching/
-# TODO: not fully implemented yet
-class Cache():
-    def __init__(self):
-        self.cache = {}
-        self.max_cache_size = 1024 * 1024 * 16
-        self.size = 0
-
-    def getsegstart(self, ea):
-        seg = getseg(ea)
-        if seg:
-            return seg.startEA
-        return BADADDR
-
-    def is_cached(self, ea):
-        segstart = self.getsegstart(ea)
-        return segstart != BADADDR
-
-    def __contains__(self, ea):
-        return incache(ea)
-
-    def update(self, ea, buf):
-        if not self.is_cached(ea) and self.size >= self.max_cache_size:
-            self.remove_oldest()
-
-        segstart = self.getsegstart(ea)
-        if segstart != BADADDR:
-            self.size += len(buf)
-            self.cache[segstart] = {'timestamp': time.time(), 'data': buf}
-
-    def remove_oldest(self):
-        oldest_entry = None
-        for key in self.cache:
-            if oldest_entry is None:
-                oldest_entry = key
-            elif self.cache[key]['timestamp'] < self.cache[oldest_entry]['timestamp']:
-                oldest_entry = key
-        if oldest_entry:
-            self.cache.pop(oldest_entry)
-            self.size = max(self.size - len(oldest_entry['data']), 0)
-
-
-# -----------------------------------------------------------------------
-
 class IDBBufHandler():
-    # TODO
     def __init__(self, loaderSegmentsOnly=False):
-        self.cache = Cache()
+        pass
 
-    def get_buf(self, ea, count=0):
-        # TODO: use/hook invalidate_dbgmem_contents() ?
-        # TODO: implement some kind of caching mechanism?
-        buf = ""
+    def get_buffers(self, ea, count=0):
+        buffers = []
+        base = offs = 0
+        i = 0
+        base = offs = 0
 
-        if USE_CACHE: # TODO experimental
-            if not self.cache.is_cached(ea):
-                buf = get_bytes(ea, count)
-                self.cache.update(ea, buf)
-            else:
-                buf = get_bytes(ea, count)
-        else:
-            result = get_bytes_and_mask(ea, count)
-            if result:
-                buf, mask = result
+        result = get_bytes_and_mask(ea, count)
+        if result:
+            buf, mask = result
+            for m in xrange(len(mask)):
+                b = ord(mask[m])
+                if i == 0:
+                    ismapped = (b&1) != 0
+                for j in xrange(8):
+                    bitset = ((b>>j) & 1) != 0
+                    if bitset != ismapped:
+                        offs = i+j
+                        buffers.append((ismapped, buf[base:offs]))
+                        base = i+j
+                        ismapped = not ismapped
 
-                for i in xrange(len(mask)):
-                    if mask[i] != '\xFF':
-                        break
-                buf = buf[:i*8].ljust(count, '\x00')
-        return buf
+                if j == 7:
+                    offs = i+j+1
+                    if m == len(mask)-1:
+                        buffers.append((ismapped, buf[base:offs]))
+                i += 8
+        return buffers
 
     def get_base(self, ea):
         base = BADADDR
@@ -160,7 +119,7 @@ class PixelWidget(QWidget):
         self.maxPixelsTotal = 0
         self.old_mouse_y = 0
         self.key = None
-        self.buf = None
+        self.buffers = None
         self.offs = 0
         self.base = 0
         self.fm = None
@@ -187,29 +146,33 @@ class PixelWidget(QWidget):
         qp.fillRect(self.rect(), Qt.black)
 
         self.img = self.render_image()
-        self.rect_x = (self.rect().width() / 2) - ((self.maxPixelsPerLine * self.pixelSize) / 2)
+        if self.img is not None:
+            self.rect_x = (self.rect().width() / 2) - ((self.maxPixelsPerLine * self.pixelSize) / 2)
 
-        qp.drawImage(QRect(QPoint(self.rect_x, 0), 
-            QPoint(self.rect_x + self.maxPixelsPerLine * self.pixelSize, (self.maxPixelsTotal / self.maxPixelsPerLine) * self.pixelSize)),
-            self.img)
+            qp.drawImage(QRect(QPoint(self.rect_x, 0), 
+                QPoint(self.rect_x + self.maxPixelsPerLine * self.pixelSize, (self.maxPixelsTotal / self.maxPixelsPerLine) * self.pixelSize)),
+                self.img)
 
         qp.end()       
 
     def render_image(self, cursor=True):
         size = self.size()
         self.maxPixelsTotal = self.maxPixelsPerLine * (size.height() / self.pixelSize)
-        self.buf = self.bh.get_buf(self.base + self.offs, self.maxPixelsTotal)       
-        self.numbytes = min(self.maxPixelsTotal, len(self.buf))
-
-        #img = QImage(self.maxPixelsPerLine, size.height() / self.pixelSize, QImage.Format_RGB32)
+        self.buffers = self.bh.get_buffers(self.base + self.offs, self.maxPixelsTotal)       
+        self.numbytes = self.maxPixelsTotal
         img = QImage(self.maxPixelsPerLine, size.height() / self.pixelSize, QImage.Format_RGB32)
         addr = self.base + self.offs
-        pixels = self.fm.render_img(self.buf[:self.numbytes], addr, self.mouseOffs)
+        pixels = self.fm.render_img(self.buffers, addr, self.mouseOffs)
+
         x = y = 0
-        for pix in pixels:
+        # transparacy effect for unmapped bytes
+        transparency_dark = [qRgb(0x2F,0x4F,0x4F), qRgb(0x00,0x00,0x00)]
+        for mapped, pix in pixels:
+            if not mapped:
+                pix = transparency_dark[(x&2 != 0) ^ (y&2 != 0)]
             img.setPixel(x, y, pix)
             x = (x + 1) % self.maxPixelsPerLine
-            if x == 0:
+            if not x:
                 y = y + 1
 
         if cursor and self.fm.highlight_cursor:
@@ -219,7 +182,27 @@ class PixelWidget(QWidget):
         return img
 
     def keyPressEvent(self, event):
-        self.key = event.key()
+        update = False
+        
+        if self.key is None:
+            self.key = event.key()
+        else:
+            if self.key == Qt.Key_Control:
+                if event.key() == Qt.Key_Plus:
+                    self.set_zoom_delta(1)
+                    update = True
+                elif event.key() == Qt.Key_Minus:
+                    self.set_zoom_delta(-1)
+                    update = True
+            elif self.key == Qt.Key_Shift:
+                if event.key() == Qt.Key_Plus:
+                    self.set_offset_delta(-self.get_width())
+                    update = True
+                elif event.key() == Qt.Key_Minus:
+                    self.set_offset_delta(self.get_width())
+                    update = True
+
+
         if self.key == Qt.Key_G:
             addr = AskAddr(self.base + self.offs, 'Jump to address')
             if addr is not None:
@@ -229,6 +212,7 @@ class PixelWidget(QWidget):
             if hlp is None:
                 hlp = "Help unavailable"
             info(hlp+"\n\n")
+            self.key = None # workaround fixme
         elif self.key == Qt.Key_F12:
             img = self.render_image(cursor = False)
             done = False
@@ -237,14 +221,41 @@ class PixelWidget(QWidget):
                 fname = 'IDACyber_%04d.bmp' % i
                 if not path.isfile(fname):
                     if img.save(fname):
-                        print 'File exported to %s' % fname
+                        msg('File exported to %s\n' % fname)
                     else:
-                        print 'Error'
+                        warning('Error exporting screenshot to %s.' % fname)
+                        self.key = None # workaround fixme
                     done = True
                 i += 1
 
+        elif self.key == Qt.Key_PageDown:
+            self.set_offset_delta(-self.get_pixels_total())
+            update = True
+
+        elif self.key == Qt.Key_PageUp:
+            self.set_offset_delta(self.get_pixels_total())
+            update = True
+
+        elif self.key == Qt.Key_Plus:
+            self.set_offset_delta(-1)
+            update = True
+
+        elif self.key == Qt.Key_Minus:
+            self.set_offset_delta(1)
+            update = True
+
+        if update:
+            if self.get_sync_state():
+                jumpto(self.base + self.offs)
+                self.activateWindow()
+                self.setFocus()
+            self.statechanged.emit()
+            self.repaint()
+
+
     def keyReleaseEvent(self, event):
-        self.key = None
+        if self.key == event.key():
+            self.key = None
         
     def mousePressEvent(self, event):
         self.old_mouse_y = event.pos().y()
@@ -361,9 +372,13 @@ class PixelWidget(QWidget):
     def get_width(self):
         return self.maxPixelsPerLine
 
-    def get_count(self):
+    # return total number of bytes in current view
+    def get_bytes_total(self):
         return self.numbytes
-        
+    
+    def get_pixels_total(self):
+        return self.maxPixelsTotal
+
     def get_address(self):
         return self.base + self.offs
 
@@ -380,7 +395,14 @@ class PixelWidget(QWidget):
         self.maxPixelsPerLine = max(1, self.maxPixelsPerLine + dwidth)
 
     def set_offset_delta(self, doffs):
-        self._set_offs(max(0, self.offs - doffs))
+        newea = self.base + self.offs - doffs
+        minea = get_inf_structure().get_minEA()
+        maxea = get_inf_structure().get_maxEA()
+        if doffs < 0:
+            delta = doffs if newea < maxea else doffs - (maxea - newea)
+        else:
+            delta = doffs if newea >= minea else doffs - (minea - newea)
+        self._set_offs(self.offs - delta)
 
     def _get_offs_by_pos(self, pos):
         elemX = self.get_elem_x()
@@ -433,7 +455,7 @@ class IDACyberForm(PluginForm):
             self.pw.get_cursor_address(),
             self.pw.get_zoom(),
             self.pw.get_width(),
-            self.pw.get_count()))
+            self.pw.get_bytes_total()))
 
     def _load_filters(self):
         filterdir = idadir('plugins/cyber')
@@ -532,11 +554,11 @@ class IDACyberPlugin(plugin_t):
     comment = ''
     help = ''
     wanted_name = 'IDACyber'
-    wanted_hotkey = 'Ctrl-P'
+    wanted_hotkey = 'Ctrl-Shift-C'
 
     def init(self):
         global banner
-        print banner
+        msg("%s" % banner)
         return PLUGIN_KEEP
 
     def run(self, arg):
